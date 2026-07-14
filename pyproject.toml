@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trigger-reply-engine"
+version = "0.1.0"
+description = "World Simulator — a manifest-driven FastAPI service that triggers realistic reactions on target gym APIs."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.32,<1.0",
+  "httpx>=0.27,<1.0",
+  "jinja2>=3.1,<4.0",
+  "pydantic>=2.9,<3.0",
+  "pydantic-settings>=2.6,<3.0",
+  "pyyaml>=6.0,<7.0",
+]
+
+[project.optional-dependencies]
+# Only needed when USE_LLM=1 (see app/generation/llm.py); kept optional so the
+# default install/image stays lean. app.config.get_settings() raises a clear
+# error at startup if USE_LLM=1 but this extra wasn't installed.
+llm = [
+  "openai>=1.50,<3.0",
+]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "respx>=0.21",
+  "ruff>=0.7",
+  "mypy>=1.13",
+  "types-PyYAML>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["B008"]  # FastAPI Depends() in defaults is idiomatic
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true

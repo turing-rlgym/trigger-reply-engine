@@ -1,0 +1,120 @@
+# Sales Explorer (LinkedIn Sales Navigator mock) — the "chat" gym.
+# Maps world actions onto the messaging inbox + timeline APIs. Session is
+# carried by the `user_id` cookie (set from the trigger's session_id).
+#
+# base_url is the default (the hosted deployment, backend under the /be
+# prefix). Override without editing this file by setting
+# SALES_EXPLORER_BASE_URL (derived from `name` by convention — see
+# app/registry.py:base_url_env_var), e.g. for local/dev use.
+name: sales_explorer
+base_url: https://sales-explorer-v1.rlgym.turing.com/be
+session:
+  cookie: user_id
+
+actions:
+  chat.reply:
+    description: A prospect replies within a conversation thread.
+    generates: [content]
+    inputs:
+      conversation_id:
+        type: string
+        required: true
+        description: Id of the conversation to append the reply to.
+      sender:
+        type: string
+        required: true
+        description: The message sender (the prospect).
+      content:
+        type: string
+        required: false
+        description: Message text. LLM-generated when omitted.
+    request:
+      method: POST
+      # POST /api/conversations/{id}/messages upserts a Message
+      path: /api/conversations/{{ conversation_id }}/messages
+      json:
+        sender: "{{ sender }}"
+        content: "{{ content }}"
+        sentAt: "{{ now }}"
+        isRead: false
+
+  chat.send:
+    description: >
+      Send a message to a lead. Mirrors the real UI's 3-call sequence: create
+      the message, patch the conversation's inbox metadata, and log a
+      message_sent timeline activity — all sharing one correlation_id (used
+      as both the message id and the timeline activity's messageId) and one
+      timestamp, so a caller only needs to supply lead_id (+ optionally
+      content). Use params.steps.<name> (message/conversation/timeline) to
+      override a step's body, e.g. steps.conversation.contactName.
+    generates: [content]
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead/conversation the message is sent to (path segment for all 3 calls).
+      sender:
+        type: string
+        required: false
+        default: "You"
+        description: Message sender, shown in the conversation thread.
+      actor:
+        type: string
+        required: false
+        default: "You"
+        description: Who performed the action, shown on the timeline activity.
+      content:
+        type: string
+        required: false
+        description: Message text. LLM-generated when omitted; also used as the timeline preview.
+      subject:
+        type: string
+        required: false
+        default: ""
+        description: Optional message subject.
+    steps:
+      - name: message
+        method: POST
+        # POST /api/conversations/{id}/messages creates the Message.
+        path: /api/conversations/{{ lead_id }}/messages
+        json:
+          id: "{{ correlation_id }}"
+          sender: "{{ sender }}"
+          content: "{{ content }}"
+          sentAt: "{{ now }}"
+          editedAt: "{{ now }}"
+          isRead: true
+          subject: "{{ subject }}"
+          smartLinks: []
+          attachments: []
+          isEdited: false
+          deleted: false
+          isInMail: false
+      - name: conversation
+        method: PATCH
+        # PATCH /api/conversations/{id} refreshes inbox metadata. contactEmail/
+        # contactName are deliberately omitted — the backend does a partial
+        # update (model_dump(exclude_unset=True), see sales-explorer
+        # repositories/messaging.py) so untouched columns are preserved; pass
+        # steps.conversation.contactName/contactEmail to set them explicitly.
+        path: /api/conversations/{{ lead_id }}
+        json:
+          unreadCount: 0
+          archived: false
+          lastUpdated: "{{ now }}"
+      - name: timeline
+        method: POST
+        # POST /api/timeline/{lead_id} logs the activity. The gym backend
+        # assigns the activity's own id — see sales-explorer
+        # repositories/timeline.py — so we deliberately do not send `id`.
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: message_sent
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ actor }}"
+          metadata:
+            messageId: "{{ correlation_id }}"
+            messagePreview: "{{ content }}"
+            isInMail: false
+            subject: "{{ subject }}"
