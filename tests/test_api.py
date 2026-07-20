@@ -78,3 +78,21 @@ def test_dry_run_builds_request_without_calling_gym(client):
     # Generation is skipped on dry-run, so the generated body stays empty.
     assert preview["json"]["content"] == ""
     assert body["generated"] == {}
+
+
+def test_dry_run_of_multistep_action_excludes_internal_step_from_previews(client):
+    """A multi-step action's `internal` (hydrate) step is a real step —
+    resolved_steps still has it — but never appears in request_previews."""
+    resp = client.post(
+        "/api/trigger",
+        json={
+            "gym_name": "sales_explorer",
+            "action": "accounts.save",
+            "session_id": "sess-1",
+            "params": {"account_id": 42, "account_name": "Acme"},
+            "dry_run": True,
+        },
+    )
+    assert resp.status_code == 200
+    previews = resp.json()["request_previews"]
+    assert [p["step"] for p in previews] == ["save"]  # hydrate excluded

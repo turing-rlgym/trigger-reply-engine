@@ -15,10 +15,11 @@ It is **manifest-driven**: each gym is described by a YAML file under
 POST /api/trigger {gym_name, action, session_id, params}
         │
         ▼
-   Engine:  validate → generate (LLM) → render steps → execute each in order → normalize
-        │                     │                  │                   │
-   Registry (manifests)   Generator (LLM/stub)  shared now/          HTTP client (Cookie:
-        │                                        correlation_id       user_id=<session_id>)
+   Engine:  validate → generate (LLM) → per step: render → execute → pipe response → normalize
+        │                     │                    │            │            │
+   Registry (manifests)   Generator (LLM/stub)  shared now/   HTTP client   ctx.steps.<name> =
+        │                                        correlation_id (Cookie:     parsed body, fed
+        │                                                        user_id=…)  into later steps
    manifests/*.yaml  ──►  target gym API (1 call for most actions, N for a multi-step one)
 ```
 
@@ -42,6 +43,22 @@ POST /api/trigger {gym_name, action, session_id, params}
   `{{ correlation_id }}`, so ids/timestamps referenced by more than one step match —
   the caller doesn't need to invent or repeat them. Steps run in order and stop at the
   first failure (no rollback); see [Adding a new gym](#adding-a-new-gym-no-code-change).
+- **Response-piping (read-modify-write).** A later step's template can read an
+  earlier step's parsed response via `{{ steps.<name>.<field> }}` — e.g. a
+  "hydrate" `GET` of the caller's current saved-items set, mutated, and `PUT`
+  back — for gyms whose write API replaces a whole collection instead of
+  appending one item (no "append one lead to a list" endpoint, only "replace
+  the list's members"). Three Jinja filters cover this: `append_unique(seq,
+  item, key=...)` (idempotent list append) and `upsert(mapping, key, value)`
+  (dict key set) for the "save"/"add" direction, and `reject_by(seq, key,
+  value)` (drop matching dict entries) for the inverse "unsave"/"remove"
+  direction. A step flagged `internal: true`
+  (e.g. the hydrate `GET`) still runs and still gets piped into later steps,
+  but is left out of the caller-facing `results`/`request_previews` since it
+  has no side effect the caller asked for. See `leads.save`/`leads.unsave`/
+  `accounts.set_crm_status` in
+  [`manifests/sales_explorer.yaml`](manifests/sales_explorer.yaml) and
+  [Adding a new gym](#adding-a-new-gym-no-code-change).
 
 ## API
 
@@ -81,8 +98,17 @@ introspection routes require the `X-API-Key` header when `API_KEY` is set
 }
 ```
 
-Response — `results`/`request_previews` are always lists, one entry per step of the
-action (length 1 for an ordinary single-request action, N for a multi-step one):
+Note there are two unrelated `steps` surfaces — don't confuse them:
+`params.steps.<name>` above (a request field) is the caller's per-step body
+*override*; `{{ steps.<name>.<field> }}` inside a manifest template (a
+response field) is a *prior step's parsed response*, fed in by the engine's
+response-piping. The override is resolved by the caller before any request is
+built; the response only exists once that step has actually executed.
+
+Response — `results`/`request_previews` are always lists, one entry per
+*non-internal* step of the action (length 1 for an ordinary single-request
+action, N for a multi-step one — an `internal` step, e.g. a read-modify-write's
+hydrate `GET`, executes and is piped into later steps but is left out here):
 
 ```jsonc
 {
@@ -105,6 +131,13 @@ multi-step action it also names the failed `step`/`step_index` and lists `comple
 UI's own fire-and-forget multi-call flows). Pass an `idempotency_key` on multi-step
 actions so a client retry after a partial failure replays the first attempt's outcome
 instead of re-running already-succeeded steps.
+
+**`dry_run` limitation:** no calls are made, so a step that pipes a prior step's
+response (e.g. a read-modify-write's hydrate `GET`) renders against an empty
+`steps` — the `append_unique`/`upsert`/`reject_by` filters treat that as an
+empty collection, so a "save" preview shows only the caller's new item(s) (not
+the actual current set on the gym) and an "unsave" preview shows an empty set
+regardless of what's actually saved.
 
 ### Example (curl)
 
@@ -168,7 +201,61 @@ actions:
         json:
           type: message_sent
           metadata: { messageId: "{{ correlation_id }}", messagePreview: "{{ content }}" }
+
+  # Read-modify-write: for a gym whose write API replaces a whole collection
+  # (no "append one" endpoint), an `internal` step hydrates the caller's
+  # current set, and a templated leaf folds the new item into it. Three
+  # filters cover this: `append_unique(seq, item, key=...)` for a list
+  # (idempotent — matches on item[key], not full equality), `upsert(mapping,
+  # key, value)` for a dict, and `reject_by(seq, key, value)` — the inverse
+  # of append_unique — to drop a matching item instead (e.g. leads.unsave).
+  # `{{ steps.hydrate.<field> }}` is that step's *parsed response*, not a
+  # caller-supplied param.
+  leads.save:
+    description: Save a lead (append-if-absent onto the full saved-leads set).
+    inputs:
+      lead_id: { type: string, required: true }
+    steps:
+      - name: hydrate
+        internal: true             # executes + is piped below; hidden from results
+        method: GET
+        path: /api/saved-leads
+      - name: save
+        method: PUT
+        path: /api/saved-leads
+        json:
+          leads: "{{ steps.hydrate.allSavedLeads | append_unique({'id': lead_id}, key='id') }}"
+
+  # The inverse action: same hydrate-then-replace shape, `reject_by` instead
+  # of `append_unique`.
+  leads.unsave:
+    description: Unsave a lead.
+    inputs:
+      lead_id: { type: string, required: true }
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/saved-leads
+      - name: save
+        method: PUT
+        path: /api/saved-leads
+        json:
+          leads: "{{ steps.hydrate.allSavedLeads | reject_by('id', lead_id) }}"
 ```
+
+Json bodies render with native typing: a leaf that is *purely* one
+`{{ expression }}` (no surrounding literal text) yields the real Python value
+of that expression — an `integer`/`boolean`-typed param renders as a real
+int/bool (not its `"str()"`), and a filter like `append_unique`/`upsert`
+above renders as a real list/dict — rather than everything being a string. A
+leaf mixing literal text with an expression (`"smartlink-{{ correlation_id }}"`)
+is always a string either way. A `string`-typed param is *never* coerced
+further even if its value looks like a number (a client-generated list id can
+be a numeric epoch-ms timestamp) — unlike stock Jinja `NativeEnvironment`,
+which would otherwise silently turn e.g. `contact_id: "123"` into the int
+`123`. An optional param the caller omits (no default) renders as `""`, not
+a raw un-filled placeholder.
 
 2. Restart the service. It appears in `GET /api/gyms` automatically — no env
    var, no code change.
@@ -180,13 +267,36 @@ actions:
    default.
 
 For a gym whose request templating can't express, subclass `ManifestAdapter`
-and override `build_requests` (see [`app/adapters/base.py`](app/adapters/base.py)).
+and override `build_step` (see [`app/adapters/base.py`](app/adapters/base.py)).
 
 The two bundled manifests map to the real gym fields:
 [`manifests/spothub.yaml`](manifests/spothub.yaml) (`POST /crm/v3/objects/emails`) and
-[`manifests/sales_explorer.yaml`](manifests/sales_explorer.yaml) — whose `chat.send` is
-the bundled multi-step example, mirroring the UI's create-message + patch-conversation +
-log-timeline-activity sequence.
+[`manifests/sales_explorer.yaml`](manifests/sales_explorer.yaml). The latter's `chat.send`
+is the simple multi-step example (create-message + patch-conversation +
+log-timeline-activity, no piping); `leads.save`/`leads.add_to_list`/`leads.create_list`
+and their `accounts.*` counterparts are the read-modify-write examples (`leads.unsave`/
+`accounts.unstar`/etc. are their `reject_by` inverses); the rest — messaging
+(`chat.send_inmail`, `chat.mark_read`/`mark_unread`, `chat.archive`/`unarchive`,
+`chat.edit_message`/`delete_message`, `chat.add_contact`), lead connections (`leads.connect`/
+`mark_connected`/`revoke_connection`), notes (`notes.create`/`create_account`/`update`/`delete`),
+saved searches, smart links
+(`smartlinks.create`/`view`/`update`/`delete`), lead-account overrides
+(`leads.set_account`/`remove_account`), company visits, list management
+(`*.update_list`/`copy_list`/`delete_list`), and notification/privacy settings —
+cover the remaining single- and multi-call, simple-write actions. Every
+user-facing write action the sales_explorer frontend exposes has a
+corresponding manifest action; a few required a deliberate fidelity
+trade-off given the static-template model (documented inline in the
+manifest next to each): `chat.mark_read`/`mark_unread` only set the
+conversation-level unread counter (not each message's `isRead`);
+`chat.archive`/`unarchive` only set the conversation-level flag; `*.remove_from_list`/
+`*.delete_list` don't cascade-unsave; `notes.create_account` never logs a
+timeline activity (only `notes.create`, its lead-only counterpart, does —
+matching the real UI, which tracks note timeline events for leads only);
+and the notification-settings actions
+either require the full payload (`settings.set_email_notifications`) or
+hydrate-and-merge the untouched categories (`settings.set_app_notifications`)
+since the gym's `PUT /api/user-state/{key}` always replaces the whole blob.
 
 ## Configuration
 
@@ -254,8 +364,11 @@ Manager secret `openai-api-key`.
 ## Development
 
 ```bash
-pytest        # 37 tests: manifests, adapter validation/encoding/multi-step, auth, dry-run,
-              #           engine vs. a mocked gym (incl. multi-step partial-failure + overrides)
+pytest        # manifests, adapter validation/encoding/multi-step/native-typing/filters
+              # (append_unique/upsert/reject_by), auth, dry-run, engine vs. a mocked gym
+              # (incl. multi-step partial-failure + overrides + response-piping
+              # read-modify-write + internal-step exclusion, across the full
+              # sales_explorer action catalog)
 ruff check app tests
 mypy app
 ```
@@ -273,7 +386,7 @@ app/
   adapters/base.py   # GymAdapter protocol + ManifestAdapter (Jinja2 rendering)
   session.py         # SessionContext + resilient execute() (cookie, retries)
   generation/        # policy.py (canned/seeded) + llm.py (stub, OpenAI, fallback)
-  engine.py          # orchestration: validate → generate → render → execute → normalize
+  engine.py          # orchestration: validate → generate → per-step render/execute/pipe → normalize
   routers/           # trigger.py, gyms.py, health.py
 manifests/           # one YAML per gym  (spothub, sales_explorer)
 tests/
