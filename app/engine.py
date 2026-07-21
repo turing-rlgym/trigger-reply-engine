@@ -1,9 +1,12 @@
 """The engine: orchestrates one trigger end to end.
 
 Pipeline: resolve gym/action -> validate + fill params -> generate the
-``generates`` fields (skipped on ``dry_run``) -> render the request -> execute
-against the gym with the session cookie -> normalize the response. Errors are
-raised as ``EngineError`` subclasses and rendered uniformly by ``app.main``.
+``generates`` fields (skipped on ``dry_run``) -> per step (in order): render
+against params + generated + engine helpers (``now``/``today``/
+``correlation_id``) + prior steps' responses -> execute against the gym with
+the session cookie -> fold the parsed response into the next step's context
+(response-piping; see ``app.adapters.base``). Errors are raised as
+``EngineError`` subclasses and rendered uniformly by ``app.main``.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from typing import Any
 
 import httpx
 
-from app.adapters.base import GymAdapter
+from app.adapters.base import GymAdapter, now_iso, today
 from app.config import Settings
 from app.errors import UpstreamError
 from app.generation.llm import GenerationRequest, Generator
@@ -150,7 +153,7 @@ class Engine:
         """The actual trigger work, run once per (non-replayed) request."""
         adapter = self.registry.get(req.gym_name)  # UnknownGymError -> 404
         # ``steps`` is a reserved top-level params key: per-step JSON body
-        # overrides keyed by step name (see ManifestAdapter.build_requests),
+        # overrides keyed by step name (see ManifestAdapter.build_step),
         # not a semantic input any action's manifest should declare.
         overrides = req.params.get("steps") or {}
         semantic = {k: v for k, v in req.params.items() if k != "steps"}
@@ -160,22 +163,45 @@ class Engine:
         generated = await self._generate(adapter, req, filled)
         filled.update(generated)
 
-        built = adapter.build_requests(req.action, filled, overrides)
+        # Computed once so every step of this trigger sees identical values
+        # (e.g. a message id referenced by two steps is bit-identical across
+        # them, not independently regenerated) — shared by the dry-run
+        # preview below and the live execute-and-pipe loop.
+        shared = {"now": now_iso(), "today": today(), "correlation_id": uuid.uuid4().hex}
+        resolved_steps = adapter.action(req.action).resolved_steps
 
         if req.dry_run:
             logger.info("trigger dry-run", extra=log_ctx)
+            # No calls are made on a dry_run, so a step that pipes a prior
+            # step's response (e.g. a read-modify-write's "hydrate" GET)
+            # renders against an empty `steps` — a documented limitation
+            # (see README) rather than a real preview of the merged body.
+            ctx = {**filled, **shared, "steps": {}}
+            previews = [
+                adapter.build_step(req.action, i, ctx, overrides.get(step.name)).preview()
+                for i, step in enumerate(resolved_steps)
+                if not step.internal
+            ]
             return TriggerResponse(
                 gym_name=req.gym_name,
                 action=req.action,
                 trigger_id=trigger_id,
                 dry_run=True,
                 generated=generated,
-                request_previews=[b.preview() for b in built],
+                request_previews=previews,
             )
 
         session = SessionContext(user_id=req.session_id, cookie_name=adapter.cookie_name)
         results: list[dict[str, Any]] = []
-        for index, request in enumerate(built):
+        # Prior steps' parsed response bodies, keyed by step name — the
+        # response-piping primitive a later step's template reads via
+        # `{{ steps.<name>.<field> }}` (e.g. a hydrate GET's current list,
+        # mutated and PUT back). Distinct from `overrides`
+        # (`params.steps.<name>`), which is caller-supplied body overrides.
+        outs: dict[str, Any] = {}
+        for index, step in enumerate(resolved_steps):
+            ctx = {**filled, **shared, "steps": outs}
+            request = adapter.build_step(req.action, index, ctx, overrides.get(step.name))
             response = await execute(
                 self._client,
                 request,
@@ -201,14 +227,19 @@ class Engine:
                     step_index=index,
                     completed=results,
                 )
-            results.append(
-                {
-                    "step": request.name,
-                    "method": request.method,
-                    "gym_status": response.status_code,
-                    "body": body,
-                }
-            )
+            outs[request.name] = body
+            # An `internal` step (e.g. a hydrate GET) still executes and
+            # pipes its response above, but has no side effect the caller
+            # asked for, so it's omitted from the caller-facing results.
+            if not request.internal:
+                results.append(
+                    {
+                        "step": request.name,
+                        "method": request.method,
+                        "gym_status": response.status_code,
+                        "body": body,
+                    }
+                )
 
         out = TriggerResponse(
             gym_name=req.gym_name,

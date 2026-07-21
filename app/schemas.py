@@ -45,12 +45,20 @@ class StepSpec(RequestSpec):
     """One HTTP call within a multi-step action.
 
     ``name`` identifies the step for: result/preview labeling, per-step caller
-    overrides (``params.steps.<name>``, see ``app.engine``), and error reporting
-    on partial failure. Left blank for an auto-generated ``step-<index>`` name
-    (see ``ActionModel.resolved_steps``).
+    overrides (``params.steps.<name>``, see ``app.engine``), response-piping
+    (``{{ steps.<name>.<field> }}`` in a later step's template, see
+    ``app.adapters.base``), and error reporting on partial failure. Left
+    blank for an auto-generated ``step-<index>`` name (see
+    ``ActionModel.resolved_steps``).
     """
 
     name: str = ""
+    # A step that exists purely to read state for a later step to template
+    # against (e.g. a "hydrate" GET before a full-collection PUT-replace) —
+    # still executed and piped into ``steps``, but omitted from the caller-
+    # facing ``results``/``request_previews`` since it has no side effect the
+    # caller asked for.
+    internal: bool = False
 
 
 class ActionModel(BaseModel):
