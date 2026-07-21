@@ -1,0 +1,78 @@
+# Cloud Build pipeline — build the image, push it, deploy to Cloud Run.
+#
+# Flow:  push to branch  ->  trigger  ->  this file  ->  Cloud Run service.
+#
+# The engine is a stateless FastAPI service, so (unlike the gym images) there is
+# no frontend build and no npm/BuildKit secret step.
+#
+# One-time GCP setup: Artifact Registry repo, a Cloud Build trigger pointing at
+# this file, a Secret Manager secret `trigger-api-key` (required — the service
+# deploys with --allow-unauthenticated at the Cloud Run layer, so the app-level
+# X-API-Key check in app/deps.py:require_api_key is what actually gates writes),
+# and (only if USE_LLM=1) a secret `openai-api-key`.
+# Each gym works with zero config (its manifest carries a default base URL);
+# the substitutions below are overrides only, to redirect a gym elsewhere.
+# The override env var for any gym is derived from its manifest `name` (see
+# app/registry.py:base_url_env_var) — add substitutions for future gyms the
+# same way, no code change required.
+
+substitutions:
+  _REGION: us-central1
+  _REPO: trigger-reply-engine
+  _SERVICE: trigger-reply-engine
+  _SPOTHUB_BASE_URL: ""
+  _SALES_EXPLORER_BASE_URL: ""
+  _USE_LLM: "0"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8000
+      - --memory=512Mi
+      - --cpu=1
+      - --min-instances=0
+      # Pinned to 1: the idempotency cache (app/engine.py _TTLCache) and its
+      # per-key locks are in-memory/per-instance. With >1 instances, a replayed
+      # idempotency key can land on a different instance and miss the cache,
+      # silently reapplying the trigger. Raise this only after moving that
+      # cache to a shared store (e.g. Redis) — see README's Idempotency note.
+      - --max-instances=1
+      - --timeout=120
+      - --set-env-vars=SPOTHUB_BASE_URL=${_SPOTHUB_BASE_URL},SALES_EXPLORER_BASE_URL=${_SALES_EXPLORER_BASE_URL},USE_LLM=${_USE_LLM},OPENAI_MODEL=gpt-4o-mini
+      # API_KEY gates writes at the app layer (see require_api_key above).
+      # OPENAI_API_KEY is only consumed when USE_LLM=1; harmless otherwise.
+      # Remove either line if the corresponding secret is absent.
+      - --set-secrets=API_KEY=trigger-api-key:latest,OPENAI_API_KEY=openai-api-key:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest

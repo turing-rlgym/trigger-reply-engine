@@ -1,0 +1,1555 @@
+# Sales Explorer (LinkedIn Sales Navigator mock) — the "chat" gym.
+# Maps world actions onto the messaging inbox + timeline APIs. Session is
+# carried by the `user_id` cookie (set from the trigger's session_id).
+#
+# base_url is the default (the hosted deployment, backend under the /be
+# prefix). Override without editing this file by setting
+# SALES_EXPLORER_BASE_URL (derived from `name` by convention — see
+# app/registry.py:base_url_env_var), e.g. for local/dev use.
+name: sales_explorer
+base_url: https://sales-explorer-v1.rlgym.turing.com/be
+session:
+  cookie: user_id
+
+actions:
+  chat.reply:
+    description: A prospect replies within a conversation thread.
+    generates: [content]
+    inputs:
+      conversation_id:
+        type: string
+        required: true
+        description: Id of the conversation to append the reply to.
+      sender:
+        type: string
+        required: true
+        description: The message sender (the prospect).
+      content:
+        type: string
+        required: false
+        description: Message text. LLM-generated when omitted.
+    request:
+      method: POST
+      # POST /api/conversations/{id}/messages upserts a Message
+      path: /api/conversations/{{ conversation_id }}/messages
+      json:
+        sender: "{{ sender }}"
+        content: "{{ content }}"
+        sentAt: "{{ now }}"
+        isRead: false
+
+  chat.send:
+    description: >
+      Send a message to a lead. Mirrors the real UI's 3-call sequence: create
+      the message, patch the conversation's inbox metadata, and log a
+      message_sent timeline activity — all sharing one correlation_id (used
+      as both the message id and the timeline activity's messageId) and one
+      timestamp, so a caller only needs to supply lead_id (+ optionally
+      content). Use params.steps.<name> (message/conversation/timeline) to
+      override a step's body, e.g. steps.conversation.contactName.
+    generates: [content]
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead/conversation the message is sent to (path segment for all 3 calls).
+      sender:
+        type: string
+        required: false
+        default: "You"
+        description: Message sender, shown in the conversation thread.
+      actor:
+        type: string
+        required: false
+        default: "You"
+        description: Who performed the action, shown on the timeline activity.
+      content:
+        type: string
+        required: false
+        description: Message text. LLM-generated when omitted; also used as the timeline preview.
+      subject:
+        type: string
+        required: false
+        default: ""
+        description: Optional message subject.
+    steps:
+      - name: message
+        method: POST
+        # POST /api/conversations/{id}/messages creates the Message.
+        path: /api/conversations/{{ lead_id }}/messages
+        json:
+          id: "{{ correlation_id }}"
+          sender: "{{ sender }}"
+          content: "{{ content }}"
+          sentAt: "{{ now }}"
+          editedAt: "{{ now }}"
+          isRead: true
+          subject: "{{ subject }}"
+          smartLinks: []
+          attachments: []
+          isEdited: false
+          deleted: false
+          isInMail: false
+      - name: conversation
+        method: PATCH
+        # PATCH /api/conversations/{id} refreshes inbox metadata. contactEmail/
+        # contactName are deliberately omitted — the backend does a partial
+        # update (model_dump(exclude_unset=True), see sales-explorer
+        # repositories/messaging.py) so untouched columns are preserved; pass
+        # steps.conversation.contactName/contactEmail to set them explicitly.
+        path: /api/conversations/{{ lead_id }}
+        json:
+          unreadCount: 0
+          archived: false
+          lastUpdated: "{{ now }}"
+      - name: timeline
+        method: POST
+        # POST /api/timeline/{lead_id} logs the activity. The gym backend
+        # assigns the activity's own id — see sales-explorer
+        # repositories/timeline.py — so we deliberately do not send `id`.
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: message_sent
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ actor }}"
+          metadata:
+            messageId: "{{ correlation_id }}"
+            messagePreview: "{{ content }}"
+            isInMail: false
+            subject: "{{ subject }}"
+
+  alerts.bookmark:
+    description: Toggle an alert's bookmark flag (the bookmark icon in the alerts feed).
+    inputs:
+      alert_id:
+        type: integer
+        required: true
+        description: Alert to bookmark/un-bookmark.
+      is_bookmarked:
+        type: integer
+        required: false
+        default: 1
+        description: 1 to bookmark, 0 to un-bookmark.
+    request:
+      method: PATCH
+      # PATCH /api/alerts/{id} — see sales-explorer routers/alerts.py +
+      # models/alert.py (AlertUpdate.is_bookmarked).
+      path: /api/alerts/{{ alert_id }}
+      json:
+        is_bookmarked: "{{ is_bookmarked }}"
+
+  alerts.dismiss:
+    description: Dismiss (delete) an alert from the feed.
+    inputs:
+      alert_id:
+        type: integer
+        required: true
+        description: Alert to dismiss.
+    request:
+      method: DELETE
+      # DELETE /api/alerts/{id} — see sales-explorer routers/alerts.py.
+      path: /api/alerts/{{ alert_id }}
+
+  smartlinks.create:
+    description: Create a smart link (a shareable, view-tracked content page).
+    generates: [title]
+    inputs:
+      title:
+        type: string
+        required: false
+        description: Smart link title. LLM-generated when omitted.
+      url:
+        type: string
+        required: false
+        default: "https://example.com"
+        description: The website URL the smart link points to.
+      label:
+        type: string
+        required: false
+        default: "Shared content"
+        description: Display label for the linked item.
+      allow_download:
+        type: boolean
+        required: false
+        default: false
+        description: Whether viewers may download the linked content.
+    request:
+      method: POST
+      # POST /api/smart-links — see sales-explorer routers/smart_links.py +
+      # models/smart_link.py (SmartLinkIn). id is client-supplied (mirrors
+      # the UI's optimistic create); viewCount/viewers/lastViewed start empty.
+      path: /api/smart-links
+      json:
+        id: "smartlink-{{ correlation_id }}"
+        title: "{{ title }}"
+        items:
+          - type: website
+            label: "{{ label }}"
+            url: "{{ url }}"
+            status: done
+        allowDownload: "{{ allow_download }}"
+        viewCount: 0
+        viewers: []
+        createdAt: "{{ now }}"
+        updatedAt: "{{ now }}"
+        lastViewed: null
+
+  leads.view:
+    description: Record a lead-profile view (mirrors opening a lead's profile panel/page).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead being viewed.
+      lead_name:
+        type: string
+        required: false
+        default: ""
+      company_name:
+        type: string
+        required: false
+        default: ""
+      source:
+        type: string
+        required: false
+        default: "panel"
+        description: "'panel' or 'page' — where the view happened."
+    request:
+      method: POST
+      # POST /api/lead-ui-views/{lead_id} increments the view count — see
+      # sales-explorer routers/lead_ui_views.py.
+      path: /api/lead-ui-views/{{ lead_id }}
+      json:
+        leadName: "{{ lead_name }}"
+        companyName: "{{ company_name }}"
+        source: "{{ source }}"
+
+  leads.unlock:
+    description: Unlock a lead's full profile (spends one unlock credit).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead to unlock.
+      lead_name:
+        type: string
+        required: false
+        default: ""
+    request:
+      method: POST
+      # POST /api/lead-unlocks/{lead_id}/unlock — see sales-explorer
+      # routers/lead_unlocks.py.
+      path: /api/lead-unlocks/{{ lead_id }}/unlock
+      json:
+        leadName: "{{ lead_name }}"
+
+  leads.save:
+    description: >
+      Save a lead to "All saved leads" (mirrors the Save button). The
+      saved-leads set is a full-collection replace — there's no "append one"
+      endpoint (see sales-explorer routers/lead_lists.py) — so this reads
+      the caller's current set (the internal `hydrate` step, hidden from
+      results), appends the lead unless it's already there, and writes the
+      whole set back.
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead to save.
+      lead_name:
+        type: string
+        required: false
+        default: ""
+      actor:
+        type: string
+        required: false
+        default: "You"
+        description: Who performed the action, shown on the timeline activity.
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        # GET /api/lead-lists returns { leadLists, leadListMapping,
+        # allSavedLeads } for the caller's session — this step only needs
+        # the last of those.
+        path: /api/lead-lists
+      - name: save
+        method: PUT
+        path: /api/saved-leads
+        json:
+          leads: "{{ steps.hydrate.allSavedLeads | append_unique({'id': lead_id, 'name': lead_name}, key='id') }}"
+      - name: timeline
+        method: POST
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: lead_saved
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ actor }}"
+          metadata: {}
+
+  leads.add_to_list:
+    description: >
+      Add a lead to an existing custom list (mirrors the "Save to list"
+      popover). Also folds the lead into "All saved leads" — the real UI
+      does both together — via the same read-modify-write as leads.save.
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: Target lead list.
+      list_name:
+        type: string
+        required: false
+        default: ""
+        description: List name, echoed onto the timeline activity.
+      lead_id:
+        type: string
+        required: true
+        description: Lead to add.
+      lead_name:
+        type: string
+        required: false
+        default: ""
+      actor:
+        type: string
+        required: false
+        default: "You"
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/lead-lists
+      - name: members
+        method: PUT
+        # PUT /api/lead-lists/{list_id}/members replaces that list's whole
+        # membership — see sales-explorer routers/lead_lists.py.
+        path: /api/lead-lists/{{ list_id }}/members
+        json:
+          leads: "{{ steps.hydrate.leadListMapping[list_id] | append_unique({'id': lead_id, 'name': lead_name}, key='id') }}"
+      - name: save
+        method: PUT
+        path: /api/saved-leads
+        json:
+          leads: "{{ steps.hydrate.allSavedLeads | append_unique({'id': lead_id, 'name': lead_name}, key='id') }}"
+      - name: timeline
+        method: POST
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: lead_added_to_list
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ actor }}"
+          metadata:
+            listId: "{{ list_id }}"
+            listName: "{{ list_name }}"
+
+  leads.create_list:
+    description: >
+      Create a new custom lead list and add a lead to it in one call
+      (mirrors the "Create new list" modal, which the real UI only reaches
+      from a lead-selection flow). Also folds the lead into "All saved
+      leads", same as leads.save.
+    inputs:
+      list_name:
+        type: string
+        required: true
+        description: Name for the new list.
+      description:
+        type: string
+        required: false
+        default: ""
+      lead_id:
+        type: string
+        required: true
+        description: Lead to add to the new list.
+      lead_name:
+        type: string
+        required: false
+        default: ""
+      actor:
+        type: string
+        required: false
+        default: "You"
+    steps:
+      - name: create
+        method: POST
+        # POST /api/lead-lists creates the list; id is client-supplied so
+        # the members step below can address it without a round trip.
+        path: /api/lead-lists
+        json:
+          id: "{{ correlation_id }}"
+          name: "{{ list_name }}"
+          description: "{{ description }}"
+      - name: members
+        method: PUT
+        path: /api/lead-lists/{{ correlation_id }}/members
+        json:
+          leads:
+            - id: "{{ lead_id }}"
+              name: "{{ lead_name }}"
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/lead-lists
+      - name: save
+        method: PUT
+        path: /api/saved-leads
+        json:
+          leads: "{{ steps.hydrate.allSavedLeads | append_unique({'id': lead_id, 'name': lead_name}, key='id') }}"
+      - name: timeline
+        method: POST
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: lead_added_to_list
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ actor }}"
+          metadata:
+            listId: "{{ correlation_id }}"
+            listName: "{{ list_name }}"
+
+  accounts.save:
+    description: >
+      Save an account (mirrors the Save button in account search/details).
+      Same read-modify-write shape as leads.save; accounts have no timeline.
+    inputs:
+      account_id:
+        type: integer
+        required: true
+        description: Account to save.
+      account_name:
+        type: string
+        required: false
+        default: ""
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        # GET /api/account-lists returns { lists, accountListMapping,
+        # allSavedAccounts, starredAccounts, crmStatusOverrides } — see
+        # sales-explorer routers/account_lists.py.
+        path: /api/account-lists
+      - name: save
+        method: PUT
+        path: /api/saved-accounts
+        json:
+          accounts: "{{ steps.hydrate.allSavedAccounts | append_unique({'id': account_id, 'name': account_name}, key='id') }}"
+
+  accounts.star:
+    description: Star an account (mirrors the star icon in account search/details).
+    inputs:
+      account_id:
+        type: integer
+        required: true
+        description: Account to star.
+      account_name:
+        type: string
+        required: false
+        default: ""
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: star
+        method: PUT
+        path: /api/starred-accounts
+        json:
+          accounts: "{{ steps.hydrate.starredAccounts | append_unique({'id': account_id, 'name': account_name}, key='id') }}"
+
+  accounts.set_crm_status:
+    description: Set an account's CRM-status override (e.g. "Customer", "Lead").
+    inputs:
+      account_id:
+        type: integer
+        required: true
+        description: Account whose CRM status is being overridden.
+      status:
+        type: string
+        required: false
+        default: "Customer"
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: crm
+        method: PUT
+        # PUT /api/account-crm-overrides replaces the whole overrides dict
+        # (accountId(str) -> status) — see sales-explorer
+        # routers/account_lists.py + models/account_list.py.
+        path: /api/account-crm-overrides
+        json:
+          overrides: "{{ steps.hydrate.crmStatusOverrides | upsert(account_id | string, status) }}"
+
+  accounts.create_list:
+    description: >
+      Create a new custom account list and add an account to it in one call.
+      Mirrors leads.create_list; accounts have no timeline.
+    inputs:
+      list_name:
+        type: string
+        required: true
+        description: Name for the new list.
+      description:
+        type: string
+        required: false
+        default: ""
+      account_id:
+        type: integer
+        required: true
+        description: Account to add to the new list.
+      account_name:
+        type: string
+        required: false
+        default: ""
+    steps:
+      - name: create
+        method: POST
+        path: /api/account-lists
+        json:
+          id: "{{ correlation_id }}"
+          name: "{{ list_name }}"
+          description: "{{ description }}"
+      - name: members
+        method: PUT
+        path: /api/account-lists/{{ correlation_id }}/members
+        json:
+          accounts:
+            - id: "{{ account_id }}"
+              name: "{{ account_name }}"
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: save
+        method: PUT
+        path: /api/saved-accounts
+        json:
+          accounts: "{{ steps.hydrate.allSavedAccounts | append_unique({'id': account_id, 'name': account_name}, key='id') }}"
+
+  accounts.add_to_list:
+    description: >
+      Add an account to an existing custom list. Also folds the account into
+      "All saved accounts", mirroring accounts.save.
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: Target account list.
+      account_id:
+        type: integer
+        required: true
+        description: Account to add.
+      account_name:
+        type: string
+        required: false
+        default: ""
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: members
+        method: PUT
+        path: /api/account-lists/{{ list_id }}/members
+        json:
+          accounts: "{{ steps.hydrate.accountListMapping[list_id] | append_unique({'id': account_id, 'name': account_name}, key='id') }}"
+      - name: save
+        method: PUT
+        path: /api/saved-accounts
+        json:
+          accounts: "{{ steps.hydrate.allSavedAccounts | append_unique({'id': account_id, 'name': account_name}, key='id') }}"
+
+  chat.send_inmail:
+    description: >
+      Send an InMail (mirrors chat.send, but always spends an InMail credit
+      regardless of whether this is the first message in the thread — same
+      as the real UI's dedicated InMail composer). Reads the caller's
+      current credit balance (internal `hydrate`, hidden from results) so
+      the decrement is correct even across repeated calls.
+    generates: [content]
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead/conversation the InMail is sent to.
+      sender:
+        type: string
+        required: false
+        default: "You"
+      actor:
+        type: string
+        required: false
+        default: "You"
+      content:
+        type: string
+        required: false
+        description: Message text. LLM-generated when omitted.
+      subject:
+        type: string
+        required: false
+        default: ""
+    steps:
+      - name: hydrate
+        internal: true
+        # GET /api/inbox returns the full inbox snapshot; this step only
+        # needs inMailCredits.
+        method: GET
+        path: /api/inbox
+      - name: message
+        method: POST
+        path: /api/conversations/{{ lead_id }}/messages
+        json:
+          id: "inmail-{{ correlation_id }}"
+          sender: "{{ sender }}"
+          content: "{{ content }}"
+          sentAt: "{{ now }}"
+          editedAt: "{{ now }}"
+          isRead: true
+          subject: "{{ subject }}"
+          smartLinks: []
+          attachments: []
+          isEdited: false
+          deleted: false
+          isInMail: true
+      - name: conversation
+        method: PATCH
+        path: /api/conversations/{{ lead_id }}
+        json:
+          unreadCount: 0
+          archived: false
+          lastUpdated: "{{ now }}"
+      - name: credits
+        method: PATCH
+        path: /api/inbox/metadata
+        json:
+          inMailCredits: "{{ [(steps.hydrate.inMailCredits if steps.hydrate.inMailCredits is defined else 50) - 1, 0] | max }}"
+      - name: timeline
+        method: POST
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: message_sent
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ actor }}"
+          metadata:
+            messageId: "inmail-{{ correlation_id }}"
+            messagePreview: "{{ content }}"
+            isInMail: true
+            subject: "{{ subject }}"
+
+  chat.mark_read:
+    description: >
+      Mark a conversation as read (mirrors opening a thread from the inbox
+      list). Sets the conversation-level unread counter only — per-message
+      `isRead` flips are a dynamic per-message loop the real UI does that a
+      static manifest step can't emit, and the unread badge/filter only
+      reads this counter.
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Conversation to mark read.
+    request:
+      method: PATCH
+      # PATCH /api/conversations/{id} — see sales-explorer routers/messaging.py.
+      path: /api/conversations/{{ lead_id }}
+      json:
+        unreadCount: 0
+
+  chat.mark_unread:
+    description: Mark a conversation as unread (mirrors the "Mark as unread" menu item).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Conversation to mark unread.
+      unread_count:
+        type: integer
+        required: false
+        default: 1
+        description: Unread count to set (the real UI recomputes this from unread messages).
+    request:
+      method: PATCH
+      path: /api/conversations/{{ lead_id }}
+      json:
+        unreadCount: "{{ unread_count }}"
+
+  chat.archive:
+    description: Archive a conversation (mirrors the archive icon/menu item in the inbox).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Conversation to archive.
+    request:
+      method: PATCH
+      path: /api/conversations/{{ lead_id }}
+      json:
+        archived: true
+        archivedAt: "{{ now }}"
+
+  chat.unarchive:
+    description: Unarchive a conversation (mirrors the unarchive icon/menu item).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Conversation to unarchive.
+    request:
+      method: PATCH
+      path: /api/conversations/{{ lead_id }}
+      json:
+        archived: false
+
+  chat.edit_message:
+    description: Edit a previously sent message's content (mirrors the message "Edit" action).
+    generates: [content]
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Conversation the message belongs to.
+      message_id:
+        type: string
+        required: true
+        description: Message to edit.
+      content:
+        type: string
+        required: false
+        description: New message text. LLM-generated when omitted.
+    steps:
+      - name: message
+        method: PATCH
+        # PATCH /api/conversations/{id}/messages/{message_id} — see
+        # sales-explorer routers/messaging.py. smartLinks is reset to []
+        # rather than re-resolved from `content` (the real UI's client-side
+        # link-resolution isn't duplicated server-side here).
+        path: /api/conversations/{{ lead_id }}/messages/{{ message_id }}
+        json:
+          content: "{{ content }}"
+          editedAt: "{{ now }}"
+          isEdited: true
+          smartLinks: []
+      - name: conversation
+        method: PATCH
+        path: /api/conversations/{{ lead_id }}
+        json:
+          lastUpdated: "{{ now }}"
+
+  chat.delete_message:
+    description: >
+      Delete a message (soft-delete — the real UI shows a "This message has
+      been deleted" chip rather than removing the row).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Conversation the message belongs to.
+      message_id:
+        type: string
+        required: true
+        description: Message to delete.
+    steps:
+      - name: message
+        method: PATCH
+        path: /api/conversations/{{ lead_id }}/messages/{{ message_id }}
+        json:
+          deleted: true
+      - name: conversation
+        method: PATCH
+        path: /api/conversations/{{ lead_id }}
+        json:
+          lastUpdated: "{{ now }}"
+
+  chat.add_contact:
+    description: >
+      Add a lead to the messaging inbox / start a conversation with them
+      (mirrors addLeadToChat/addMessagingLead). Upserts the messaging-lead
+      record; no timeline activity (the real UI logs none for this).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead to add as a messaging contact.
+      lead_name:
+        type: string
+        required: false
+        default: ""
+      email:
+        type: string
+        required: false
+        default: ""
+      first_name:
+        type: string
+        required: false
+        default: ""
+      last_name:
+        type: string
+        required: false
+        default: ""
+    request:
+      method: PUT
+      # PUT /api/messaging-leads/{lead_id} upserts (id forced from path) —
+      # see sales-explorer routers/messaging.py.
+      path: /api/messaging-leads/{{ lead_id }}
+      json:
+        name: "{{ lead_name }}"
+        email: "{{ email }}"
+        archived: false
+        personalDetails:
+          firstName: "{{ first_name }}"
+          lastName: "{{ last_name }}"
+          email: "{{ email }}"
+
+  leads.connect:
+    description: Send a LinkedIn-style connection request to a lead.
+    generates: [personal_message]
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead to connect with.
+      lead_name:
+        type: string
+        required: false
+        default: ""
+      personal_message:
+        type: string
+        required: false
+        description: Note attached to the request. LLM-generated when omitted.
+    request:
+      method: POST
+      # POST /api/lead-connections — see sales-explorer
+      # routers/lead_connections.py + models/lead_connection.py.
+      path: /api/lead-connections
+      json:
+        leadId: "{{ lead_id }}"
+        leadName: "{{ lead_name }}"
+        status: pending
+        personalMessage: "{{ personal_message }}"
+        sentAt: "{{ now }}"
+
+  leads.mark_connected:
+    description: Mark a pending connection request as accepted.
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead whose connection request was accepted.
+    request:
+      method: PATCH
+      # PATCH /api/lead-connections/{lead_id} — see sales-explorer
+      # routers/lead_connections.py.
+      path: /api/lead-connections/{{ lead_id }}
+      json:
+        status: connected
+
+  leads.revoke_connection:
+    description: Revoke/withdraw a connection request.
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead whose connection request is revoked.
+    request:
+      method: DELETE
+      path: /api/lead-connections/{{ lead_id }}
+
+  notes.create:
+    description: >
+      Create a note on a lead and log a note_added timeline activity —
+      mirrors the real UI's lead NotesPanel. Pipes the server-assigned note
+      id (the `note` step, hidden from results) into the timeline body's
+      `noteId`. Lead-only: see notes.create_account for the account
+      equivalent, which the real UI never logs to timeline (see
+      sales-explorer useNotesStore.ts, leadId.startsWith("lead-") gate).
+    generates: [content]
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead the note is attached to.
+      content:
+        type: string
+        required: false
+        description: Note text. LLM-generated when omitted.
+      is_private:
+        type: boolean
+        required: false
+        default: false
+      entity_name:
+        type: string
+        required: false
+        default: ""
+      author:
+        type: string
+        required: false
+        default: "You"
+    steps:
+      - name: note
+        method: POST
+        # POST /api/notes/{entity_id} — see sales-explorer routers/notes.py.
+        # The server assigns the note's id (Note.from_row), piped below.
+        path: /api/notes/{{ lead_id }}
+        json:
+          content: "{{ content }}"
+          isPrivate: "{{ is_private }}"
+          entityName: "{{ entity_name }}"
+          author: "{{ author }}"
+      - name: timeline
+        method: POST
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: note_added
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ author }}"
+          metadata:
+            noteId: "{{ steps.note.id }}"
+            notePreview: "{{ content }}"
+
+  notes.create_account:
+    description: >
+      Create a note on an account (mirrors the account NotesPanel). No
+      timeline activity: the real UI only logs note_added for leads (see
+      sales-explorer useNotesStore.ts, leadId.startsWith("lead-") gate).
+    generates: [content]
+    inputs:
+      account_id:
+        type: integer
+        required: true
+        description: Account the note is attached to.
+      content:
+        type: string
+        required: false
+        description: Note text. LLM-generated when omitted.
+      is_private:
+        type: boolean
+        required: false
+        default: false
+      entity_name:
+        type: string
+        required: false
+        default: ""
+      author:
+        type: string
+        required: false
+        default: "You"
+    request:
+      method: POST
+      # POST /api/notes/{entity_id} — see sales-explorer routers/notes.py.
+      path: /api/notes/account-{{ account_id }}
+      json:
+        content: "{{ content }}"
+        isPrivate: "{{ is_private }}"
+        entityName: "{{ entity_name }}"
+        author: "{{ author }}"
+
+  notes.update:
+    description: >
+      Edit a note's text (mirrors the note "Edit" action). Only touches
+      `content` — `isPrivate` is left as-is (PATCH is a partial update; see
+      sales-explorer routers/notes.py, ``exclude_unset``).
+    generates: [content]
+    inputs:
+      entity_id:
+        type: string
+        required: true
+        description: Lead or account the note is attached to.
+      note_id:
+        type: string
+        required: true
+        description: Note to edit.
+      content:
+        type: string
+        required: false
+        description: New note text. LLM-generated when omitted.
+    request:
+      method: PATCH
+      path: /api/notes/{{ entity_id }}/{{ note_id }}
+      json:
+        content: "{{ content }}"
+
+  notes.delete:
+    description: Delete a note.
+    inputs:
+      entity_id:
+        type: string
+        required: true
+        description: Lead or account the note is attached to.
+      note_id:
+        type: string
+        required: true
+        description: Note to delete.
+    request:
+      method: DELETE
+      path: /api/notes/{{ entity_id }}/{{ note_id }}
+
+  savedsearches.create:
+    description: Save the current search filters for quick re-run (mirrors the "Save search" button).
+    generates: [name]
+    inputs:
+      name:
+        type: string
+        required: false
+        description: Name for the saved search. LLM-generated when omitted.
+      type:
+        type: string
+        required: false
+        default: "Lead"
+        description: "'Lead' or 'Account'."
+      filters:
+        type: object
+        required: false
+        default: {}
+        description: Search filter state to persist (opaque to the gym).
+    request:
+      method: POST
+      # POST /api/saved-searches — see sales-explorer
+      # routers/saved_searches.py + models/saved_search.py. id is
+      # client-supplied (mirrors the store's optimistic create).
+      path: /api/saved-searches
+      json:
+        id: "search-{{ correlation_id }}"
+        name: "{{ name }}"
+        type: "{{ type }}"
+        filters: "{{ filters }}"
+        createdAt: "{{ now }}"
+        viewedAt: "{{ now }}"
+
+  savedsearches.update:
+    description: >
+      Rename a saved search. Only touches `name` (PATCH is a partial
+      update; see sales-explorer routers/saved_searches.py, ``exclude_unset``).
+    inputs:
+      search_id:
+        type: string
+        required: true
+        description: Saved search to rename.
+      name:
+        type: string
+        required: true
+        description: New name.
+    request:
+      method: PATCH
+      path: /api/saved-searches/{{ search_id }}
+      json:
+        name: "{{ name }}"
+
+  savedsearches.delete:
+    description: Delete a saved search.
+    inputs:
+      search_id:
+        type: string
+        required: true
+        description: Saved search to delete.
+    request:
+      method: DELETE
+      path: /api/saved-searches/{{ search_id }}
+
+  savedsearches.mark_viewed:
+    description: Record that a saved search was opened (mirrors clicking it in the saved-searches list).
+    inputs:
+      search_id:
+        type: string
+        required: true
+        description: Saved search that was opened.
+    request:
+      method: PATCH
+      path: /api/saved-searches/{{ search_id }}/viewed
+
+  smartlinks.view:
+    description: >
+      Record a smart-link view (mirrors a recipient opening a shared smart
+      link — a prospect-side world event, unlike smartlinks.create which is
+      the sender-side action).
+    inputs:
+      link_id:
+        type: string
+        required: true
+        description: Smart link that was viewed.
+      duration_seconds:
+        type: number
+        required: false
+        default: 30
+        description: How long the viewer spent on the linked content.
+    request:
+      method: POST
+      # POST /api/smart-links/{id}/view — see sales-explorer
+      # routers/smart_links.py. Body is optional server-side; sent anyway
+      # for a deterministic, inspectable request.
+      path: /api/smart-links/{{ link_id }}/view
+      json:
+        durationSeconds: "{{ duration_seconds }}"
+
+  smartlinks.update:
+    description: >
+      Edit a smart link (mirrors the smart-link edit modal, which submits
+      title/items/allowDownload together as a full form — not a partial
+      single-field patch). Same single-website-item shape as
+      smartlinks.create.
+    generates: [title]
+    inputs:
+      link_id:
+        type: string
+        required: true
+        description: Smart link to edit.
+      title:
+        type: string
+        required: false
+        description: New title. LLM-generated when omitted.
+      url:
+        type: string
+        required: false
+        default: "https://example.com"
+      label:
+        type: string
+        required: false
+        default: "Shared content"
+      allow_download:
+        type: boolean
+        required: false
+        default: false
+    request:
+      method: PATCH
+      path: /api/smart-links/{{ link_id }}
+      json:
+        title: "{{ title }}"
+        items:
+          - type: website
+            label: "{{ label }}"
+            url: "{{ url }}"
+            status: done
+        allowDownload: "{{ allow_download }}"
+
+  smartlinks.delete:
+    description: Delete a smart link.
+    inputs:
+      link_id:
+        type: string
+        required: true
+        description: Smart link to delete.
+    request:
+      method: DELETE
+      path: /api/smart-links/{{ link_id }}
+
+  leads.set_account:
+    description: Reassign a lead to a different account (mirrors the "Change account" action on a lead).
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead being reassigned.
+      account_id:
+        type: integer
+        required: true
+        description: New account id.
+      account_name:
+        type: string
+        required: true
+        description: New account name.
+      original_account_id:
+        type: integer
+        required: false
+        description: The lead's account id before this override, if known.
+      original_account_name:
+        type: string
+        required: false
+        description: The lead's account name before this override, if known.
+    request:
+      method: POST
+      # POST /api/lead-account-overrides/{lead_id} — see sales-explorer
+      # routers/lead_account_overrides.py (upsert). original_account_id/name
+      # are true optionals (JSON null, not "") when omitted — the field is
+      # typed int|None / str|None server-side, so an empty-string fallback
+      # would 422.
+      path: /api/lead-account-overrides/{{ lead_id }}
+      json:
+        currentAccountId: "{{ account_id }}"
+        currentAccountName: "{{ account_name }}"
+        originalAccountId: "{{ original_account_id if original_account_id is defined else none }}"
+        originalAccountName: "{{ original_account_name if original_account_name is defined else none }}"
+        updatedAt: "{{ now }}"
+
+  leads.remove_account:
+    description: Revert a lead's account override back to its original account.
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead whose account override is removed.
+    request:
+      method: DELETE
+      path: /api/lead-account-overrides/{{ lead_id }}
+
+  company.visit:
+    description: Record a visit to a company's detail page.
+    inputs:
+      company_id:
+        type: string
+        required: true
+        description: Company/account visited.
+      company_name:
+        type: string
+        required: false
+        default: ""
+    request:
+      method: POST
+      # POST /api/company-visits/{company_id} increments the visit count —
+      # see sales-explorer routers/company_visits.py.
+      path: /api/company-visits/{{ company_id }}
+      json:
+        companyName: "{{ company_name }}"
+        lastVisitDate: "{{ now }}"
+
+  leads.unsave:
+    description: >
+      Unsave a lead (inverse of leads.save). Same read-modify-write shape,
+      using `reject_by` instead of `append_unique`.
+    inputs:
+      lead_id:
+        type: string
+        required: true
+        description: Lead to unsave.
+      actor:
+        type: string
+        required: false
+        default: "You"
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/lead-lists
+      - name: save
+        method: PUT
+        path: /api/saved-leads
+        json:
+          leads: "{{ steps.hydrate.allSavedLeads | reject_by('id', lead_id) }}"
+      - name: timeline
+        method: POST
+        path: /api/timeline/{{ lead_id }}
+        json:
+          type: lead_unsaved
+          leadId: "{{ lead_id }}"
+          timestamp: "{{ now }}"
+          actor: "{{ actor }}"
+          metadata: {}
+
+  leads.remove_from_list:
+    description: >
+      Remove a lead from a custom list (inverse of leads.add_to_list). Only
+      touches list membership — the real UI's conditional cascade-unsave
+      (dropping the lead from "All saved leads" too, but only if it's in no
+      other list) isn't expressible as a static template and is not
+      replicated here. No timeline activity: the real UI's
+      lead_removed_from_list tracking is itself a no-op (see
+      sales-explorer useTimelineStore.addLeadRemovedFromListActivity).
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: List to remove the lead from.
+      lead_id:
+        type: string
+        required: true
+        description: Lead to remove.
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/lead-lists
+      - name: members
+        method: PUT
+        path: /api/lead-lists/{{ list_id }}/members
+        json:
+          leads: "{{ steps.hydrate.leadListMapping[list_id] | reject_by('id', lead_id) }}"
+
+  accounts.unsave:
+    description: Unsave an account (inverse of accounts.save).
+    inputs:
+      account_id:
+        type: integer
+        required: true
+        description: Account to unsave.
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: save
+        method: PUT
+        path: /api/saved-accounts
+        json:
+          accounts: "{{ steps.hydrate.allSavedAccounts | reject_by('id', account_id) }}"
+
+  accounts.remove_from_list:
+    description: >
+      Remove an account from a custom list (inverse of accounts.add_to_list).
+      Only touches list membership — same cascade-unsave caveat as
+      leads.remove_from_list.
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: List to remove the account from.
+      account_id:
+        type: integer
+        required: true
+        description: Account to remove.
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: members
+        method: PUT
+        path: /api/account-lists/{{ list_id }}/members
+        json:
+          accounts: "{{ steps.hydrate.accountListMapping[list_id] | reject_by('id', account_id) }}"
+
+  accounts.unstar:
+    description: Unstar an account (inverse of accounts.star).
+    inputs:
+      account_id:
+        type: integer
+        required: true
+        description: Account to unstar.
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: unstar
+        method: PUT
+        path: /api/starred-accounts
+        json:
+          accounts: "{{ steps.hydrate.starredAccounts | reject_by('id', account_id) }}"
+
+  leads.update_list:
+    description: Rename/redescribe a lead list (mirrors the list "Edit" modal, which submits both fields together).
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: List to update.
+      name:
+        type: string
+        required: true
+        description: New list name.
+      description:
+        type: string
+        required: false
+        default: ""
+      last_modified_by:
+        type: string
+        required: false
+        default: "You"
+    request:
+      method: PATCH
+      # PATCH /api/lead-lists/{id} — see sales-explorer routers/lead_lists.py.
+      # lastUpdatedAt (epoch ms) is left unset; the gym isn't required to
+      # advance it for this action to be observably correct.
+      path: /api/lead-lists/{{ list_id }}
+      json:
+        name: "{{ name }}"
+        description: "{{ description }}"
+        lastModifiedBy: "{{ last_modified_by }}"
+
+  leads.copy_list:
+    description: >
+      Duplicate a lead list under a new name, copying its current members
+      (mirrors the list "Duplicate" action).
+    inputs:
+      source_list_id:
+        type: string
+        required: true
+        description: List to copy.
+      list_name:
+        type: string
+        required: true
+        description: Name for the new list.
+      description:
+        type: string
+        required: false
+        default: ""
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/lead-lists
+      - name: create
+        method: POST
+        # id is client-supplied so the members step below can address it
+        # without a round trip (mirrors leads.create_list).
+        path: /api/lead-lists
+        json:
+          id: "{{ correlation_id }}"
+          name: "{{ list_name }}"
+          description: "{{ description }}"
+      - name: members
+        method: PUT
+        path: /api/lead-lists/{{ correlation_id }}/members
+        json:
+          leads: "{{ steps.hydrate.leadListMapping[source_list_id] or [] }}"
+
+  leads.delete_list:
+    description: Delete a lead list (does not touch "All saved leads" membership — see leads.remove_from_list's cascade caveat).
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: List to delete.
+    request:
+      method: DELETE
+      path: /api/lead-lists/{{ list_id }}
+
+  accounts.update_list:
+    description: Rename/redescribe an account list (mirrors the list "Edit" modal).
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: List to update.
+      name:
+        type: string
+        required: true
+        description: New list name.
+      description:
+        type: string
+        required: false
+        default: ""
+    request:
+      method: PATCH
+      # PATCH /api/account-lists/{id} — see sales-explorer routers/account_lists.py.
+      path: /api/account-lists/{{ list_id }}
+      json:
+        name: "{{ name }}"
+        description: "{{ description }}"
+        lastUpdated: "{{ today }}"
+
+  accounts.copy_list:
+    description: Duplicate an account list under a new name, copying its current members.
+    inputs:
+      source_list_id:
+        type: string
+        required: true
+        description: List to copy.
+      list_name:
+        type: string
+        required: true
+        description: Name for the new list.
+      description:
+        type: string
+        required: false
+        default: ""
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/account-lists
+      - name: create
+        method: POST
+        path: /api/account-lists
+        json:
+          id: "{{ correlation_id }}"
+          name: "{{ list_name }}"
+          description: "{{ description }}"
+      - name: members
+        method: PUT
+        path: /api/account-lists/{{ correlation_id }}/members
+        json:
+          accounts: "{{ steps.hydrate.accountListMapping[source_list_id] or [] }}"
+
+  accounts.delete_list:
+    description: Delete an account list (does not touch "All saved accounts" membership — see accounts.remove_from_list's cascade caveat).
+    inputs:
+      list_id:
+        type: string
+        required: true
+        description: List to delete.
+    request:
+      method: DELETE
+      path: /api/account-lists/{{ list_id }}
+
+  settings.set_privacy:
+    description: >
+      Update profile-viewing and activity-sharing privacy settings. Omitting
+      a field resets it to its platform default (same convention as
+      accounts.set_crm_status) — the gym's PUT replaces the whole blob, so
+      there's no partial-merge to preserve an unspecified field's current
+      value.
+    inputs:
+      profile_viewing_option:
+        type: string
+        required: false
+        default: "name-headline"
+        description: One of name-headline / private-characteristics / private-mode.
+      linkedin_activities_enabled:
+        type: boolean
+        required: false
+        default: true
+    request:
+      method: PUT
+      # PUT /api/user-state/settings-privacy — see sales-explorer
+      # routers/user_state.py (validated against _SettingsPrivacy, extra
+      # fields allowed).
+      path: /api/user-state/settings-privacy
+      json:
+        profileViewingOption: "{{ profile_viewing_option }}"
+        linkedInActivitiesEnabled: "{{ linkedin_activities_enabled }}"
+
+  settings.set_email_notifications:
+    description: >
+      Replace the email-notification toggle list. The gym's PUT replaces the
+      whole blob (no per-item endpoint) and the real UI always writes back
+      its complete client-side list when one item is toggled, so the caller
+      must supply the complete desired set too.
+    inputs:
+      notifications:
+        type: array
+        required: true
+        description: "Full list of {id, type, emailAddress, enabled} toggles to persist."
+    request:
+      method: PUT
+      path: /api/user-state/settings-email-notifications
+      json:
+        notifications: "{{ notifications }}"
+
+  settings.set_app_notifications:
+    description: >
+      Update in-app notification toggles across the leads/accounts/shared-
+      activity categories. Unlike settings.set_email_notifications, this key
+      stores three independent categories in one blob, so an omitted
+      category reads its current value (internal `hydrate`, hidden from
+      results) instead of resetting to empty — the real UI never touches
+      more than one category per toggle, and blanking the other two would
+      silently destroy their state.
+    inputs:
+      saved_leads_notifications:
+        type: array
+        required: false
+        description: Full "leads" category toggle list. Omit to leave this category unchanged.
+      saved_accounts_notifications:
+        type: array
+        required: false
+        description: Full "accounts" category toggle list. Omit to leave this category unchanged.
+      shared_activity_notifications:
+        type: array
+        required: false
+        description: Full "shared activity" category toggle list. Omit to leave this category unchanged.
+    steps:
+      - name: hydrate
+        internal: true
+        method: GET
+        path: /api/user-state/settings-app-notifications
+      - name: notifications
+        method: PUT
+        path: /api/user-state/settings-app-notifications
+        json:
+          savedLeadsNotifications: "{{ saved_leads_notifications or steps.hydrate.savedLeadsNotifications or [] }}"
+          savedAccountsNotifications: "{{ saved_accounts_notifications or steps.hydrate.savedAccountsNotifications or [] }}"
+          sharedActivityNotifications: "{{ shared_activity_notifications or steps.hydrate.sharedActivityNotifications or [] }}"

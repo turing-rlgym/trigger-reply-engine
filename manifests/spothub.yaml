@@ -1,0 +1,58 @@
+# Spothub (HubSpot CRM mock) — the "email" gym.
+# Maps world actions onto the CRM engagements + contacts APIs. Session is carried
+# by the `user_id` cookie (set from the trigger's session_id).
+#
+# base_url is the default (the hosted v1 deployment). Override without editing
+# this file by setting SPOTHUB_BASE_URL (derived from `name` by convention —
+# see app/registry.py:base_url_env_var), e.g. for local/dev use.
+name: spothub
+base_url: https://spothub-v5.rlgym.turing.com/be
+session:
+  cookie: user_id
+
+actions:
+  email.reply:
+    description: A prospect replies to an email, creating an inbound email engagement.
+    generates: [description]
+    inputs:
+      contact_id:
+        type: string
+        required: true
+        description: Contact the email engagement is associated with.
+      title:
+        type: string
+        required: false
+        default: "Re: your email"
+        description: Email subject line.
+      description:
+        type: string
+        required: false
+        description: Email body. LLM-generated when omitted.
+    request:
+      method: POST
+      # POST /crm/v3/objects/emails creates an engagement; properties are the
+      # spothub email slice fields (see app/repositories/engagements.py EMAILS).
+      path: /crm/v3/objects/emails
+      json:
+        properties:
+          contactId: "{{ contact_id }}"
+          title: "{{ title }}"
+          description: "{{ description }}"
+          contacted: true
+          date: "{{ today }}"
+
+  email.unsubscribe:
+    description: A prospect unsubscribes; mark the contact opted out of all email.
+    inputs:
+      contact_id:
+        type: string
+        required: true
+        description: Contact to mark as unsubscribed.
+    request:
+      method: PATCH
+      # PATCH the contact; unsubscribedFromAllEmail is the stored contact field
+      # (see spothub lib/store/slices/contactsSlice.ts).
+      path: /crm/v3/objects/contacts/{{ contact_id }}
+      json:
+        properties:
+          unsubscribedFromAllEmail: true

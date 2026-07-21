@@ -1,0 +1,33 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trigger-reply-engine:latest
+    container_name: trigger-reply-engine
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      PORT: "8000"
+      # Gym base URL overrides. Each gym works with zero config (its manifest
+      # carries a default); set these only to redirect a gym elsewhere — e.g.
+      # for local/dev use, where host.docker.internal reaches the host from
+      # Docker Desktop. The env var name for any gym is derived from its
+      # manifest `name` (see app/registry.py:base_url_env_var).
+      SPOTHUB_BASE_URL: ${SPOTHUB_BASE_URL:-}
+      SALES_EXPLORER_BASE_URL: ${SALES_EXPLORER_BASE_URL:-}
+      # Reply generation (off by default -> deterministic stub, no key needed).
+      USE_LLM: ${USE_LLM:-0}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-15}
+      # Required on X-API-Key for /api/trigger + introspection; empty = no auth
+      # (fine for this local/dev compose file, not for a reachable deployment).
+      API_KEY: ${API_KEY:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

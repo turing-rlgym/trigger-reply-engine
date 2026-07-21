@@ -1,0 +1,43 @@
+# Pinned runtime dependencies (core + the `llm` extra) for reproducible Docker
+# builds — see Dockerfile, which installs this before `pip install .`. Dev-only
+# tools (pytest, ruff, mypy, respx, ...) are intentionally excluded; see
+# pyproject.toml's `dev` extra for those.
+#
+# Regenerate after bumping a version bound in pyproject.toml:
+#   pip install --upgrade '.[llm]' && pip freeze --exclude-editable \
+#     | grep -v -iE '^(pytest|ruff|mypy|respx|types-pyyaml|iniconfig|pathspec|pluggy|pygments)' \
+#     > requirements.txt
+
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.14.2
+ast_serialize==0.6.0
+certifi==2026.6.17
+click==8.4.2
+colorama==0.4.6
+distro==1.9.0
+fastapi==0.139.0
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.18
+Jinja2==3.1.6
+jiter==0.16.0
+librt==0.13.0
+MarkupSafe==3.0.3
+openai==2.45.0
+packaging==26.2
+pydantic==2.13.4
+pydantic-settings==2.14.2
+pydantic_core==2.46.4
+python-dotenv==1.2.2
+PyYAML==6.0.3
+sniffio==1.3.1
+starlette==1.3.1
+tqdm==4.68.4
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+uvicorn==0.51.0
+watchfiles==1.2.0
+websockets==16.1
